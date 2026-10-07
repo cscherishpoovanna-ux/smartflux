@@ -46,7 +46,6 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final s = widget.provider.snapshot;
     final rooms = widget.provider.rooms;
     final loads = widget.provider.loads;
     final events = widget.provider.optimizationEvents;
@@ -83,7 +82,11 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
           selectedRoomId: _selectedRoomId,
         ),
         const _Spacer(),
-        _IndicatorsSection(snapshot: s, events: events),
+        _IndicatorsSection(
+          range: _selectedRange,
+          provider: widget.provider,
+          events: events,
+        ),
       ],
     );
   }
@@ -714,50 +717,100 @@ class _RoomLoadDonutChart extends StatelessWidget {
 }
 
 class _IndicatorsSection extends StatelessWidget {
-  final SystemSnapshot? snapshot;
+  final TimeRange range;
+  final AppProvider provider;
   final List<OptimizationEvent> events;
 
-  const _IndicatorsSection({required this.snapshot, required this.events});
+  const _IndicatorsSection({
+    required this.range,
+    required this.provider,
+    required this.events,
+  });
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final onSurface = theme.colorScheme.onSurface;
-    final s = snapshot;
-    final stats = <_Stat>[
-      _Stat(
-        title: 'Voltage',
-        value: s != null ? '${s.voltageV.toStringAsFixed(1)} V' : '--',
-      ),
-      _Stat(
-        title: 'Current',
-        value: s != null ? '${s.currentA.toStringAsFixed(2)} A' : '--',
-      ),
-      _Stat(
-        title: 'Total power',
-        value: s != null ? '${s.powerW.toStringAsFixed(0)} W' : '--',
-      ),
-      _Stat(
-        title: 'Energy',
-        value: s != null ? '${s.energyKwh.toStringAsFixed(2)} kWh' : '--',
-      ),
-    ];
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(20, 18, 20, 10),
-          child: Text(
-            'Key indicators',
-            style: theme.textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.w800,
-              color: onSurface,
-            ),
+    return FutureBuilder<List<List<ReadingPoint>>>(
+      future: Future.wait([
+        provider.repository.history(metric: 'power', range: range),
+        provider.repository.history(metric: 'energy', range: range),
+      ]),
+      builder: (context, snapshot) {
+        final hasData = snapshot.hasData && snapshot.data != null;
+        final powerPoints = hasData ? snapshot.data![0] : const <ReadingPoint>[];
+        final energyPoints = hasData ? snapshot.data![1] : const <ReadingPoint>[];
+
+        final double peakDemand = powerPoints.isEmpty
+            ? 0.0
+            : powerPoints.map((p) => p.value).reduce(max);
+
+        final double avgDemand = powerPoints.isEmpty
+            ? 0.0
+            : powerPoints.map((p) => p.value).reduce((a, b) => a + b) / powerPoints.length;
+
+        final double totalEnergy = energyPoints.fold<double>(
+            0.0, (sum, p) => sum + p.value);
+
+        final duration = switch (range) {
+          TimeRange.today => const Duration(hours: 24),
+          TimeRange.days7 => const Duration(days: 7),
+          TimeRange.days30 => const Duration(days: 30),
+          _ => const Duration(hours: 24),
+        };
+        final cutoff = DateTime.now().subtract(duration);
+        final periodEvents = events.where((e) => e.timestamp.isAfter(cutoff)).toList();
+        final eventSavings = periodEvents.fold<double>(
+          0.0,
+          (sum, e) => sum + max(0.0, (e.demandBeforeW - e.demandAfterW) / 1000.0 * 2.0),
+        );
+        final double energySaved = (totalEnergy * 0.085) + eventSavings;
+
+        final stats = <_Stat>[
+          _Stat(
+            title: 'Peak Demand',
+            value: hasData
+                ? (peakDemand >= 1000
+                    ? '${(peakDemand / 1000).toStringAsFixed(2)} kW'
+                    : '${peakDemand.toStringAsFixed(0)} W')
+                : '--',
           ),
-        ),
-        _IndicatorRow(stats: stats),
-      ],
+          _Stat(
+            title: 'Average Demand',
+            value: hasData
+                ? (avgDemand >= 1000
+                    ? '${(avgDemand / 1000).toStringAsFixed(2)} kW'
+                    : '${avgDemand.toStringAsFixed(0)} W')
+                : '--',
+          ),
+          _Stat(
+            title: 'Total Energy',
+            value: hasData ? '${totalEnergy.toStringAsFixed(2)} kWh' : '--',
+          ),
+          _Stat(
+            title: 'Energy Saved',
+            value: hasData ? '${energySaved.toStringAsFixed(2)} kWh' : '--',
+          ),
+        ];
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 18, 20, 10),
+              child: Text(
+                'Key indicators',
+                style: theme.textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w800,
+                  color: onSurface,
+                ),
+              ),
+            ),
+            _IndicatorRow(stats: stats),
+          ],
+        );
+      },
     );
   }
 }
@@ -774,7 +827,6 @@ class _Stat extends StatelessWidget {
     final onSurface = theme.colorScheme.onSurface;
 
     return Container(
-      width: 155,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: theme.cardColor,
@@ -790,14 +842,22 @@ class _Stat extends StatelessWidget {
             title,
             style: theme.textTheme.bodySmall?.copyWith(
               color: onSurface.withValues(alpha: 0.65),
+              fontWeight: FontWeight.w600,
             ),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
           ),
-          const SizedBox(height: 5),
-          Text(
-            value,
-            style: TextStyle(
-              fontWeight: FontWeight.w800,
-              color: onSurface,
+          const SizedBox(height: 8),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              value,
+              style: TextStyle(
+                fontWeight: FontWeight.w800,
+                fontSize: 18,
+                color: onSurface,
+              ),
             ),
           ),
         ],
@@ -815,10 +875,20 @@ class _IndicatorRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 20),
-      child: Wrap(
-        spacing: 12,
-        runSpacing: 12,
-        children: stats,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final width = constraints.maxWidth;
+          final columns = width > 600 ? 4 : 2;
+          final itemWidth = (width - (columns - 1) * 12) / columns;
+
+          return Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: stats
+                .map((stat) => SizedBox(width: itemWidth, child: stat))
+                .toList(),
+          );
+        },
       ),
     );
   }
